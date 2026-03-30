@@ -6,6 +6,7 @@ async def login():
         context = await p.chromium.launch_persistent_context(
             user_data_dir="./hailuo_profile",
             headless=False,
+            channel="chrome",
             args=["--start-maximized"],
             viewport=None
         )
