@@ -26,6 +26,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 HAILUO_URL = "https://hailuoai.video/create/image-to-video"
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
+HAILUO_TOKEN = os.getenv("HAILUO_TOKEN", "")
 VIDEO_WAIT_TIMEOUT_MS = 900000  # 15 mins
 SCREENSHOT_DIR = os.path.join(_HERE, "screenshots")
 HAILUO_PROFILE_DIR = os.path.join(_HERE, "..", "hailuo_profile")
@@ -84,6 +85,14 @@ async def get_context():
         ignore_default_args=["--enable-automation"],
         viewport=None,
     )
+    if HAILUO_TOKEN:
+        await _ctx_instance.add_cookies([{
+            "name": "_token",
+            "value": HAILUO_TOKEN,
+            "domain": "hailuoai.video",
+            "path": "/",
+        }])
+        print("  🍪 Injected HAILUO_TOKEN cookie")
     return _ctx_instance
 
 
