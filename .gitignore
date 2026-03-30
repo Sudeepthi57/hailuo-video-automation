@@ -50,6 +50,7 @@ htmlcov/
 
 # Hailuo
 hailuo_profile/
+screenshots/
 
 # Misc
 *.tmp

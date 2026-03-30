@@ -3,10 +3,12 @@ Hailuo Video Automation — with Model Selection
 """
 
 import os
+import sys
 import asyncio
 import tempfile
 import base64
 import time
+import subprocess
 from typing import Optional
 
 import httpx
@@ -37,9 +39,54 @@ browser_semaphore = asyncio.Semaphore(1)
 _auth_cache: dict = {"logged_in": False, "ts": 0.0}
 _AUTH_CACHE_TTL = 60  # seconds
 
+# Persistent browser context — shared across all operations
+_pw_instance = None
+_ctx_instance = None
+
 
 def _chrome_launch_args():
     return ["--no-first-run", "--no-default-browser-check", "--disable-blink-features=AutomationControlled"]
+
+
+def _kill_hailuo_chrome():
+    """Kill any unmanaged Chrome process using hailuo_profile."""
+    try:
+        subprocess.run(["pkill", "-f", HAILUO_PROFILE_DIR], capture_output=True)
+        time.sleep(1.5)
+    except Exception:
+        pass
+
+
+async def get_context():
+    """Return the existing live browser context, or launch a new one."""
+    global _pw_instance, _ctx_instance
+
+    if _ctx_instance:
+        try:
+            _ = _ctx_instance.pages  # raises if context is dead
+            return _ctx_instance
+        except Exception:
+            _ctx_instance = None
+            try:
+                await _pw_instance.stop()
+            except Exception:
+                pass
+            _pw_instance = None
+
+    _kill_hailuo_chrome()
+    _pw_instance = await async_playwright().start()
+    _ctx_instance = await _pw_instance.chromium.launch_persistent_context(
+        user_data_dir=HAILUO_PROFILE_DIR,
+        channel="chrome",
+        headless=False,
+        args=[
+            "--start-maximized",
+            "--disable-blink-features=AutomationControlled",
+        ] + _chrome_launch_args(),
+        ignore_default_args=["--enable-automation"],
+        viewport=None,
+    )
+    return _ctx_instance
 
 
 async def _check_logged_in(context) -> bool:
@@ -111,184 +158,309 @@ async def download_image(url: str, shot_id: str) -> str:
 
 async def run_hailuo(shot_id: str, prompt: str, image_path: str, model: str = "Hailuo 2.3-Fast") -> dict:
     async with browser_semaphore:
-        async with async_playwright() as p:
-            print(f"  🌐 [{shot_id}] Launching Chrome...")
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=HAILUO_PROFILE_DIR,
-                channel="chrome",
-                headless=False,
-                args=[
-                    "--start-maximized",
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ],
-                ignore_default_args=["--enable-automation"],
-                viewport=None
-            )
+        print(f"  🌐 [{shot_id}] Getting Chrome context...")
+        context = await get_context()
+
+        # Reuse an existing hailuoai page if open, otherwise create one
+        page = None
+        for p in context.pages:
+            if "hailuoai" in p.url:
+                page = p
+                break
+        if page is None:
             page = await context.new_page()
 
-            try:
-                # ── Step 1: Open Hailuo ──────────────────────
-                print(f"  🌐 [{shot_id}] Opening Hailuo image-to-video page...")
-                await page.goto(HAILUO_URL, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(8000)
-                await page.screenshot(path=f"{SCREENSHOT_DIR}/step1_loaded_{shot_id}.png")
-                print(f"  ✅ [{shot_id}] Page loaded: {page.url}")
+        try:
+            # ── Step 1: Open Hailuo ──────────────────────
+            print(f"  🌐 [{shot_id}] Opening Hailuo image-to-video page...")
+            await page.goto(HAILUO_URL, wait_until="domcontentloaded", timeout=30000)
+            # Scroll down and back up to trigger lazy-loading of history videos
+            await page.wait_for_timeout(5000)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(3000)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(2000)
+            await page.screenshot(path=f"{SCREENSHOT_DIR}/step1_loaded_{shot_id}.png")
+            print(f"  ✅ [{shot_id}] Page loaded: {page.url}")
 
-                # ── Step 2: Dismiss any modal ────────────────
+            # ── Step 2: Dismiss any modal ────────────────
+            try:
+                close_btn = await page.wait_for_selector(
+                    "section.fixed button, [aria-label='Close'], .close-btn",
+                    timeout=3000
+                )
+                if close_btn:
+                    await close_btn.click()
+                    await page.wait_for_timeout(1000)
+                    print(f"  ✅ [{shot_id}] Dismissed modal")
+            except Exception:
+                pass
+
+            # ── Step 3: Select model ──────────────────────
+            print(f"  🤖 [{shot_id}] Selecting model: {model}...")
+            try:
+                model_btn = await page.wait_for_selector(
+                    "[data-tour='model-selection-guide']",
+                    timeout=5000
+                )
+                await model_btn.click()
+                await page.wait_for_timeout(1500)
+                await page.screenshot(path=f"{SCREENSHOT_DIR}/step3a_model_open_{shot_id}.png")
+
+                clicked_model = await page.evaluate(f"""() => {{
+                    const divs = Array.from(document.querySelectorAll('div.font-500'));
+                    const target = divs.find(d => d.textContent.trim() === '{model}');
+                    if (target) {{
+                        const row = target.closest('[class*="flex"][class*="items-center"]');
+                        if (row) {{ row.click(); return true; }}
+                        target.click();
+                        return true;
+                    }}
+                    return false;
+                }}""")
+
+                if clicked_model:
+                    print(f"  ✅ [{shot_id}] Model '{model}' selected!")
+                else:
+                    print(f"  ⚠️ [{shot_id}] Model '{model}' not found — using default")
+
+                await page.wait_for_timeout(1500)
+                await page.screenshot(path=f"{SCREENSHOT_DIR}/step3b_model_selected_{shot_id}.png")
+            except Exception as e:
+                print(f"  ⚠️ [{shot_id}] Model selection failed (using default): {e}")
+
+            # ── Step 4: Upload image to Start Frame ──────
+            print(f"  📤 [{shot_id}] Uploading image to Start Frame...")
+            file_inputs = await page.query_selector_all(
+                "input[type='file'][accept='.jpg,.jpeg,.png,.webp']"
+            )
+            if not file_inputs:
+                await page.screenshot(path=f"{SCREENSHOT_DIR}/error_no_upload_{shot_id}.png")
+                raise Exception("No file input found — check screenshot!")
+
+            start_frame_input = file_inputs[0]
+            await page.evaluate("el => { el.style.display = 'block'; el.style.opacity = '1'; }", start_frame_input)
+
+            # Wait for Hailuo's image upload API response before setting the file,
+            # so we can detect when the server-side upload finishes.
+            image_upload_done = {"value": False}
+
+            async def on_image_upload_response(response):
+                if image_upload_done["value"]:
+                    return
+                if not response.ok or "hailuoai" not in response.url:
+                    return
+                if "json" not in response.headers.get("content-type", ""):
+                    return
                 try:
-                    close_btn = await page.wait_for_selector(
-                        "section.fixed button, [aria-label='Close'], .close-btn",
-                        timeout=3000
+                    if response.request.method.upper() != "POST":
+                        return
+                    data = await response.json()
+                    # Hailuo returns an image URL / asset key after upload
+                    url_val = (
+                        (data.get("data") or {}).get("url") or
+                        (data.get("data") or {}).get("ossUrl") or
+                        (data.get("data") or {}).get("fileUrl") or
+                        (data.get("data") or {}).get("imageUrl")
                     )
-                    if close_btn:
-                        await close_btn.click()
-                        await page.wait_for_timeout(1000)
-                        print(f"  ✅ [{shot_id}] Dismissed modal")
+                    if url_val:
+                        image_upload_done["value"] = True
+                        print(f"  ✅ [{shot_id}] Server confirmed image upload: {str(url_val)[:80]}")
                 except Exception:
                     pass
 
-                # ── Step 3: Select model ──────────────────────
-                print(f"  🤖 [{shot_id}] Selecting model: {model}...")
+            page.on("response", on_image_upload_response)
+            await start_frame_input.set_input_files(image_path)
+            print(f"  📤 [{shot_id}] File set — waiting for server-side upload to complete...")
+
+            # Wait up to 30s for server confirmation, then fall back to fixed wait
+            for _ in range(30):
+                if image_upload_done["value"]:
+                    break
+                await asyncio.sleep(1)
+            page.remove_listener("response", on_image_upload_response)
+
+            if not image_upload_done["value"]:
+                print(f"  ⚠️ [{shot_id}] Upload confirmation not seen — waiting extra 5s")
+                await page.wait_for_timeout(5000)
+
+            await page.wait_for_timeout(1000)  # brief settle
+            await page.screenshot(path=f"{SCREENSHOT_DIR}/step4_uploaded_{shot_id}.png")
+
+            # ── Step 5: Fill prompt ───────────────────────
+            print(f"  📝 [{shot_id}] Filling prompt...")
+            prompt_box = await page.wait_for_selector("#video-create-textarea", timeout=10000)
+            if not prompt_box:
+                raise Exception("Prompt box not found!")
+
+            await prompt_box.click()
+            await page.wait_for_timeout(300)
+            await prompt_box.fill(prompt)
+            await page.wait_for_timeout(1000)
+            await page.screenshot(path=f"{SCREENSHOT_DIR}/step5_prompted_{shot_id}.png")
+            print(f"  ✅ [{shot_id}] Prompt filled!")
+
+            # ── Step 6: Record submit timestamp + click Generate ─
+            submit_time_sec = int(time.time())  # seconds — matches Hailuo's createTime
+            gen_batch_id = {"value": None}
+            video_result  = {"url": None}
+            feed_api_url  = {"value": None}  # captured for active polling
+
+            async def capture_batch_id(response):
+                """Grab our batchID from the generate POST response only."""
+                if not response.ok or "hailuoai" not in response.url:
+                    return
+                if "json" not in response.headers.get("content-type", ""):
+                    return
                 try:
-                    # Click the model selector button
-                    model_btn = await page.wait_for_selector(
-                        "[data-tour='model-selection-guide']",
-                        timeout=5000
-                    )
-                    await model_btn.click()
-                    await page.wait_for_timeout(1500)
-                    await page.screenshot(path=f"{SCREENSHOT_DIR}/step3a_model_open_{shot_id}.png")
-
-                    # Find and click the target model by its text
-                    clicked_model = await page.evaluate(f"""() => {{
-                        const divs = Array.from(document.querySelectorAll('div.font-500'));
-                        const target = divs.find(d => d.textContent.trim() === '{model}');
-                        if (target) {{
-                            // Click the parent container of the model option
-                            const row = target.closest('[class*="flex"][class*="items-center"]');
-                            if (row) {{ row.click(); return true; }}
-                            target.click();
-                            return true;
-                        }}
-                        return false;
-                    }}""")
-
-                    if clicked_model:
-                        print(f"  ✅ [{shot_id}] Model '{model}' selected!")
-                    else:
-                        print(f"  ⚠️ [{shot_id}] Model '{model}' not found — using default")
-
-                    await page.wait_for_timeout(1500)
-                    await page.screenshot(path=f"{SCREENSHOT_DIR}/step3b_model_selected_{shot_id}.png")
-
+                    if response.request.method.upper() != "POST":
+                        return  # feed polling is GET; generate is POST
+                    data = await response.json()
+                    def find(obj, key, depth=0):
+                        if depth > 5: return None
+                        if isinstance(obj, dict):
+                            if key in obj and obj[key]: return str(obj[key])
+                            for v in obj.values():
+                                r = find(v, key, depth + 1)
+                                if r: return r
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                r = find(item, key, depth + 1)
+                                if r: return r
+                        return None
+                    bid = find(data, "batchID")
+                    if bid and not gen_batch_id["value"]:
+                        gen_batch_id["value"] = str(bid)
+                        print(f"  🎯 [{shot_id}] Batch ID from generate API: {bid}")
                 except Exception as e:
-                    print(f"  ⚠️ [{shot_id}] Model selection failed (using default): {e}")
+                    print(f"  ⚠️ [{shot_id}] capture_batch_id error: {e}")
 
-                # ── Step 4: Upload image to Start Frame ──────
-                print(f"  📤 [{shot_id}] Uploading image to Start Frame...")
-
-                file_inputs = await page.query_selector_all(
-                    "input[type='file'][accept='.jpg,.jpeg,.png,.webp']"
-                )
-                if not file_inputs:
-                    await page.screenshot(path=f"{SCREENSHOT_DIR}/error_no_upload_{shot_id}.png")
-                    raise Exception("No file input found — check screenshot!")
-
-                start_frame_input = file_inputs[0]
-                await page.evaluate("el => { el.style.display = 'block'; el.style.opacity = '1'; }", start_frame_input)
-                await start_frame_input.set_input_files(image_path)
-                print(f"  ✅ [{shot_id}] Image uploaded to Start Frame!")
-                await page.wait_for_timeout(4000)
-                await page.screenshot(path=f"{SCREENSHOT_DIR}/step4_uploaded_{shot_id}.png")
-
-                # ── Step 5: Fill prompt (contenteditable div) ─
-                print(f"  📝 [{shot_id}] Filling prompt...")
-
-                prompt_box = await page.wait_for_selector(
-                    "#video-create-textarea",
-                    timeout=10000
-                )
-                if not prompt_box:
-                    raise Exception("Prompt box not found!")
-
-                await page.evaluate("el => el.focus()", prompt_box)
-                await page.wait_for_timeout(500)
-                await page.keyboard.press("Control+a")
-                await page.keyboard.press("Backspace")
-                await page.wait_for_timeout(300)
-
-                await page.evaluate(f"navigator.clipboard.writeText({repr(prompt)})")
-                await page.keyboard.press("Control+v")
-                await page.wait_for_timeout(1000)
-
-                await page.screenshot(path=f"{SCREENSHOT_DIR}/step5_prompted_{shot_id}.png")
-                print(f"  ✅ [{shot_id}] Prompt filled!")
-
-                # ── Step 6: Snapshot existing videos ─────────
-                existing_videos = await page.evaluate("""() => {
-                    return Array.from(document.querySelectorAll('video'))
-                        .map(v => v.src || v.currentSrc || v.getAttribute('src'))
-                        .filter(s => s);
-                }""")
-                print(f"  📹 [{shot_id}] Existing videos: {len(existing_videos)}")
-
-                # ── Step 7: Click Generate button ────────────
-                print(f"  🔘 [{shot_id}] Clicking Generate button...")
-
-                generate_btn = await page.wait_for_selector(
-                    "button.new-color-btn-bg",
-                    timeout=10000
-                )
-                await page.evaluate("el => el.click()", generate_btn)
-                print(f"  ✅ [{shot_id}] Generate clicked!")
-                await page.wait_for_timeout(3000)
-                await page.screenshot(path=f"{SCREENSHOT_DIR}/step7_after_click_{shot_id}.png")
-
-                # ── Step 8: Wait for new video ────────────────
-                print(f"  ⏳ [{shot_id}] Waiting for video (up to 15 mins)...")
-
-                await page.wait_for_function(
-                    """(existingSrcs) => {
-                        const videos = Array.from(document.querySelectorAll('video'));
-                        return videos.filter(v => {
-                            const src = v.src || v.currentSrc || v.getAttribute('src');
-                            return src && !existingSrcs.includes(src);
-                        }).length > 0;
-                    }""",
-                    arg=existing_videos,
-                    timeout=VIDEO_WAIT_TIMEOUT_MS
-                )
-
-                video_url = await page.evaluate(
-                    """(existingSrcs) => {
-                        const videos = Array.from(document.querySelectorAll('video'));
-                        const v = videos.find(v => {
-                            const src = v.src || v.currentSrc || v.getAttribute('src');
-                            return src && !existingSrcs.includes(src);
-                        });
-                        return v ? (v.src || v.currentSrc || v.getAttribute('src')) : null;
-                    }""",
-                    existing_videos
-                )
-
-                await page.screenshot(path=f"{SCREENSHOT_DIR}/step8_done_{shot_id}.png")
-                print(f"  🎬 [{shot_id}] Video ready: {video_url}")
-
-                return {"shot_id": shot_id, "status": "success", "message": "Video generated!", "video_url": video_url}
-
-            except Exception as e:
-                print(f"  ❌ [{shot_id}] ERROR: {e}")
+            def _extract_url_from_feed(data):
+                """Parse feed JSON and return video URL if our batch is done."""
                 try:
-                    await page.screenshot(path=f"{SCREENSHOT_DIR}/final_error_{shot_id}.png")
-                except:
-                    pass
-                return {"shot_id": shot_id, "status": "error", "message": str(e), "video_url": None}
+                    d = data.get("data", data) if isinstance(data, dict) else {}
+                    batch_feeds = d.get("batchFeeds") if isinstance(d, dict) else None
+                    if not batch_feeds:
+                        return None
+                    our_bid = gen_batch_id["value"]
+                    for batch in batch_feeds:
+                        bid = str(batch.get("batchID", ""))
+                        for feed in batch.get("feeds", []):
+                            info = feed.get("commonInfo", {})
+                            status = int(info.get("status", 0))  # normalize to int
+                            create_time = int(info.get("createTime", 0))  # in seconds
+                            if status != 2:
+                                continue
+                            # Match by batchID (primary) or submit timestamp (fallback)
+                            if our_bid and bid != our_bid:
+                                continue
+                            if not our_bid and create_time <= submit_time_sec:
+                                continue
+                            url = (feed.get("metaInfo", {})
+                                       .get("videoMetaInfo", {})
+                                       .get("mediaInfo", {})
+                                       .get("url", ""))
+                            if url:
+                                return url
+                except Exception as e:
+                    print(f"  ⚠️ [{shot_id}] _extract_url_from_feed error: {e}")
+                return None
 
-            finally:
-                await page.close()
-                await context.close()
+            async def monitor_feed(response):
+                """Watch the feed polling API for our batch completing."""
+                if not response.ok or video_result["url"]:
+                    return
+                if "json" not in response.headers.get("content-type", ""):
+                    return
+                try:
+                    data = await response.json()
+                    # Capture feed URL for active polling fallback
+                    if not feed_api_url["value"] and isinstance(data, dict):
+                        d = data.get("data", {})
+                        if isinstance(d, dict) and d.get("batchFeeds"):
+                            feed_api_url["value"] = response.url
+                            print(f"  📡 [{shot_id}] Feed URL captured: {response.url[:100]}")
+                    url = _extract_url_from_feed(data)
+                    if url:
+                        video_result["url"] = url
+                        print(f"  🎬 [{shot_id}] Video found via feed listener: {url}")
+                except Exception as e:
+                    print(f"  ⚠️ [{shot_id}] monitor_feed error: {e}")
+
+            page.on("response", capture_batch_id)
+            page.on("response", monitor_feed)
+
+            print(f"  🔘 [{shot_id}] Clicking Generate button...")
+            generate_btn = await page.wait_for_selector("button.new-color-btn-bg", timeout=10000)
+            await generate_btn.click()  # Playwright native click — triggers React handlers
+            print(f"  ✅ [{shot_id}] Generate clicked! Waiting for batch ID...")
+            await page.wait_for_timeout(5000)
+            page.remove_listener("response", capture_batch_id)
+            print(f"  ⏳ [{shot_id}] Tracking batch={gen_batch_id['value']} since t={submit_time_sec}")
+            await page.screenshot(path=f"{SCREENSHOT_DIR}/step7_after_click_{shot_id}.png")
+
+            # ── Step 7: Wait — listener + active polling fallback ──
+            deadline = time.time() + VIDEO_WAIT_TIMEOUT_MS / 1000
+            last_active_poll = 0.0
+
+            while time.time() < deadline:
+                if video_result["url"]:
+                    break
+
+                # Active poll every 15s once we have the feed URL
+                # (handles case where page stops polling after cycleTime=0)
+                now = time.time()
+                if feed_api_url["value"] and (now - last_active_poll) >= 15:
+                    last_active_poll = now
+                    try:
+                        feed_url_safe = feed_api_url["value"].replace('"', '')
+                        result = await page.evaluate(f"""async () => {{
+                            try {{
+                                const r = await fetch("{feed_url_safe}", {{credentials: 'include'}});
+                                if (!r.ok) return null;
+                                return await r.json();
+                            }} catch(e) {{ return null; }}
+                        }}""")
+                        if result:
+                            url = _extract_url_from_feed(result)
+                            if url:
+                                video_result["url"] = url
+                                print(f"  🎬 [{shot_id}] Video found via active poll: {url}")
+                                break
+                            else:
+                                try:
+                                    feeds = result.get("data", {}).get("batchFeeds", [{}])
+                                    s = feeds[0].get("feeds", [{}])[0].get("commonInfo", {}).get("status", "?") if feeds else "?"
+                                    bid_in = str(feeds[0].get("batchID", "?")) if feeds else "?"
+                                    print(f"  ⏳ [{shot_id}] Active poll: batch={bid_in} status={s} (want batch={gen_batch_id['value']})")
+                                except Exception:
+                                    print(f"  ⏳ [{shot_id}] Active poll: processing...")
+                    except Exception as e:
+                        print(f"  ⚠️ [{shot_id}] Active poll error: {e}")
+
+                await asyncio.sleep(2)
+
+            page.remove_listener("response", monitor_feed)
+
+            video_url = video_result["url"]
+            if not video_url:
+                raise Exception("Video generation timed out or URL not found in feed")
+            await page.screenshot(path=f"{SCREENSHOT_DIR}/step8_done_{shot_id}.png")
+
+            await page.screenshot(path=f"{SCREENSHOT_DIR}/step8_done_{shot_id}.png")
+            print(f"  🎬 [{shot_id}] Video ready: {video_url}")
+            return {"shot_id": shot_id, "status": "success", "message": "Video generated!", "video_url": video_url}
+
+        except Exception as e:
+            print(f"  ❌ [{shot_id}] ERROR: {e}")
+            try:
+                await page.screenshot(path=f"{SCREENSHOT_DIR}/final_error_{shot_id}.png")
+            except Exception:
+                pass
+            return {"shot_id": shot_id, "status": "error", "message": str(e), "video_url": None}
+
+        finally:
+            pass  # keep the page and context open — Chrome stays running
 
 # ─────────────────────────────────────────────
 # AUTH ENDPOINTS
@@ -301,6 +473,7 @@ async def auth_status():
         return {"logged_in": _auth_cache["logged_in"]}
 
     try:
+        _kill_hailuo_chrome()
         async with async_playwright() as p:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=HAILUO_PROFILE_DIR,
@@ -394,53 +567,24 @@ async def auth_login_verify():
         return {"logged_in": False, "error": str(e)}
 
 
-# Global hailuo browser (kept open for the "Open Hailuo" button)
-_hailuo_pw = None
-_hailuo_ctx = None
-
-
 @app.post("/hailuo/open")
 async def hailuo_open():
-    """Open (or focus) hailuoai.video in the automation Chrome profile."""
-    global _hailuo_pw, _hailuo_ctx
-
-    # If already open, just navigate to the create page
-    if _hailuo_ctx:
-        try:
-            pages = _hailuo_ctx.pages
-            if pages:
-                await pages[0].bring_to_front()
-                return {"success": True}
-        except Exception:
-            pass  # context died, reopen below
-        try:
-            await _hailuo_ctx.close()
-        except Exception:
-            pass
-        try:
-            await _hailuo_pw.stop()
-        except Exception:
-            pass
-        _hailuo_ctx = None
-        _hailuo_pw = None
-
+    """Open or focus hailuoai.video in the shared automation Chrome context."""
     try:
-        _hailuo_pw = await async_playwright().start()
-        _hailuo_ctx = await _hailuo_pw.chromium.launch_persistent_context(
-            user_data_dir=HAILUO_PROFILE_DIR,
-            channel="chrome",
-            headless=False,
-            args=["--start-maximized"] + _chrome_launch_args(),
-            ignore_default_args=["--enable-automation"],
-            viewport=None,
-        )
-        page = await _hailuo_ctx.new_page()
-        await page.goto("https://hailuoai.video/create/image-to-video",
-                        wait_until="domcontentloaded", timeout=30000)
+        context = await get_context()
+        url = "https://hailuoai.video/create/image-to-video"
+
+        # If a hailuoai tab is already open, bring it to front
+        for p in context.pages:
+            if "hailuoai" in p.url:
+                await p.bring_to_front()
+                return {"success": True}
+
+        # Otherwise open a new tab
+        page = await context.new_page()
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         return {"success": True}
     except Exception as e:
-        _hailuo_ctx = None
-        _hailuo_pw = None
         return {"success": False, "message": str(e)}
 
 
