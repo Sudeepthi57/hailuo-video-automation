@@ -6,6 +6,7 @@ import os
 import asyncio
 import tempfile
 import base64
+import time
 from typing import Optional
 
 import httpx
@@ -31,6 +32,23 @@ VALID_MODELS = ["Hailuo 2.3-Fast", "Hailuo 1.0-Director", "Hailuo 2.0"]
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 browser_semaphore = asyncio.Semaphore(1)
+
+# Simple cache: (logged_in: bool, timestamp: float)
+_auth_cache: dict = {"logged_in": False, "ts": 0.0}
+_AUTH_CACHE_TTL = 60  # seconds
+
+
+def _chrome_launch_args():
+    return ["--no-first-run", "--no-default-browser-check", "--disable-blink-features=AutomationControlled"]
+
+
+async def _check_logged_in(context) -> bool:
+    """Check for the _token cookie — present only when logged in to Hailuo."""
+    try:
+        cookies = await context.cookies(["https://hailuoai.video"])
+        return any(c["name"] == "_token" for c in cookies)
+    except Exception:
+        return False
 
 # ─────────────────────────────────────────────
 # APP
@@ -97,7 +115,7 @@ async def run_hailuo(shot_id: str, prompt: str, image_path: str, model: str = "H
             print(f"  🌐 [{shot_id}] Launching Chrome...")
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=HAILUO_PROFILE_DIR,
-                executable_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                channel="chrome",
                 headless=False,
                 args=[
                     "--start-maximized",
@@ -271,6 +289,160 @@ async def run_hailuo(shot_id: str, prompt: str, image_path: str, model: str = "H
             finally:
                 await page.close()
                 await context.close()
+
+# ─────────────────────────────────────────────
+# AUTH ENDPOINTS
+# ─────────────────────────────────────────────
+
+@app.get("/auth/status")
+async def auth_status():
+    global _auth_cache
+    if time.time() - _auth_cache["ts"] < _AUTH_CACHE_TTL:
+        return {"logged_in": _auth_cache["logged_in"]}
+
+    try:
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=HAILUO_PROFILE_DIR,
+                channel="chrome",
+                headless=True,
+                args=_chrome_launch_args(),
+                ignore_default_args=["--enable-automation"],
+            )
+            try:
+                logged_in = await _check_logged_in(context)
+            finally:
+                await context.close()
+
+        _auth_cache = {"logged_in": logged_in, "ts": time.time()}
+        return {"logged_in": logged_in}
+    except Exception as e:
+        return {"logged_in": False, "error": str(e)}
+
+
+# Global login session (kept alive between start/verify calls)
+_login_pw = None
+_login_ctx = None
+
+
+@app.post("/auth/login/start")
+async def auth_login_start():
+    """Open a visible Chrome window for manual login. Returns immediately."""
+    global _login_pw, _login_ctx
+    # Clean up any previous session
+    try:
+        if _login_ctx:
+            await _login_ctx.close()
+        if _login_pw:
+            await _login_pw.stop()
+    except Exception:
+        pass
+
+    try:
+        _login_pw = await async_playwright().start()
+        _login_ctx = await _login_pw.chromium.launch_persistent_context(
+            user_data_dir=HAILUO_PROFILE_DIR,
+            channel="chrome",
+            headless=False,
+            args=["--start-maximized"] + _chrome_launch_args(),
+            ignore_default_args=["--enable-automation"],
+            viewport=None,
+        )
+        page = await _login_ctx.new_page()
+        await page.goto("https://hailuoai.video", wait_until="domcontentloaded", timeout=30000)
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/auth/login/verify")
+async def auth_login_verify():
+    """Close the visible Chrome window, then do a headless check to confirm login."""
+    global _login_pw, _login_ctx, _auth_cache
+    # Close visible browser first so profile is free for headless check
+    try:
+        if _login_ctx:
+            await _login_ctx.close()
+        if _login_pw:
+            await _login_pw.stop()
+    except Exception:
+        pass
+    finally:
+        _login_ctx = None
+        _login_pw = None
+
+    await asyncio.sleep(1)  # let Chrome release the profile lock
+
+    try:
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=HAILUO_PROFILE_DIR,
+                channel="chrome",
+                headless=True,
+                args=_chrome_launch_args(),
+                ignore_default_args=["--enable-automation"],
+            )
+            try:
+                logged_in = await _check_logged_in(context)
+            finally:
+                await context.close()
+
+        if logged_in:
+            _auth_cache = {"logged_in": True, "ts": time.time()}
+        return {"logged_in": logged_in}
+    except Exception as e:
+        return {"logged_in": False, "error": str(e)}
+
+
+# Global hailuo browser (kept open for the "Open Hailuo" button)
+_hailuo_pw = None
+_hailuo_ctx = None
+
+
+@app.post("/hailuo/open")
+async def hailuo_open():
+    """Open (or focus) hailuoai.video in the automation Chrome profile."""
+    global _hailuo_pw, _hailuo_ctx
+
+    # If already open, just navigate to the create page
+    if _hailuo_ctx:
+        try:
+            pages = _hailuo_ctx.pages
+            if pages:
+                await pages[0].bring_to_front()
+                return {"success": True}
+        except Exception:
+            pass  # context died, reopen below
+        try:
+            await _hailuo_ctx.close()
+        except Exception:
+            pass
+        try:
+            await _hailuo_pw.stop()
+        except Exception:
+            pass
+        _hailuo_ctx = None
+        _hailuo_pw = None
+
+    try:
+        _hailuo_pw = await async_playwright().start()
+        _hailuo_ctx = await _hailuo_pw.chromium.launch_persistent_context(
+            user_data_dir=HAILUO_PROFILE_DIR,
+            channel="chrome",
+            headless=False,
+            args=["--start-maximized"] + _chrome_launch_args(),
+            ignore_default_args=["--enable-automation"],
+            viewport=None,
+        )
+        page = await _hailuo_ctx.new_page()
+        await page.goto("https://hailuoai.video/create/image-to-video",
+                        wait_until="domcontentloaded", timeout=30000)
+        return {"success": True}
+    except Exception as e:
+        _hailuo_ctx = None
+        _hailuo_pw = None
+        return {"success": False, "message": str(e)}
+
 
 # ─────────────────────────────────────────────
 # API ENDPOINTS
