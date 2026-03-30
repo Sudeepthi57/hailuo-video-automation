@@ -21,18 +21,19 @@ Excel storyboard → Upload → Review & attach images → Generate videos
 ```
 hailuo-video-automation/
 ├── backend/
-│   ├── main.py           # FastAPI server — Playwright automation logic
-│   ├── login.py          # One-time login script to save browser session
+│   ├── main.py           # FastAPI server — Playwright automation + auth endpoints
+│   ├── login.py          # Legacy one-time login script (CLI alternative)
 │   └── requirements.txt  # Python dependencies
 ├── frontend/
 │   ├── app/              # Next.js app router (layout, page, global styles)
 │   ├── components/
-│   │   ├── UploadScreen.tsx    # Excel upload + parsing
-│   │   ├── ReviewScreen.tsx    # Shot editor + image crop
-│   │   └── GenerateScreen.tsx  # Generation dashboard
+│   │   ├── LoginScreen.tsx    # In-app login flow (open Chrome, verify session)
+│   │   ├── UploadScreen.tsx   # Excel upload + parsing
+│   │   ├── ReviewScreen.tsx   # Shot editor + image crop
+│   │   └── GenerateScreen.tsx # Generation dashboard
 │   ├── package.json
 │   └── tsconfig.json
-├── hailuo_profile/       # Browser session (auto-created by login.py, gitignored)
+├── hailuo_profile/       # Browser session (auto-created on first login, gitignored)
 ├── .env.example          # Environment variable reference
 └── README.md
 ```
@@ -80,20 +81,32 @@ The default API key is `my-secret-key` — change it in both places if deploying
 | `NEXT_PUBLIC_API_URL` | `frontend/.env.local` | Backend URL |
 | `NEXT_PUBLIC_API_KEY` | `frontend/.env.local` | Must match `API_KEY` |
 
-> **Note:** `GenerateScreen.tsx` currently has the URL and key hardcoded. Update lines 12–13 to use `process.env.NEXT_PUBLIC_*` when you add the `.env.local` file.
+> **Note:** `GenerateScreen.tsx` still has `API_URL` and `API_KEY` hardcoded at lines 12–13. Update them to use `process.env.NEXT_PUBLIC_API_URL` / `process.env.NEXT_PUBLIC_API_KEY` when deploying beyond localhost.
 
 ---
 
 ## First-Time Login
 
-The backend uses a persistent Chromium profile to stay logged in to Hailuo. Run this once:
+The backend uses a persistent Chromium profile to stay logged in to Hailuo. The session is saved to `hailuo_profile/` at the project root and reused for all future runs.
+
+### Option A — In-app (recommended)
+
+With both the backend and frontend running, open [http://localhost:3000](http://localhost:3000). If your session has expired or was never set up, use the **LoginScreen** component:
+
+1. Click **Open Hailuo & Log In** — a Chrome window opens pointing to hailuoai.video
+2. Log in manually in that window
+3. Click **I've Logged In ✓** — the backend closes the window and verifies the session cookie
+
+A floating **Open Hailuo** button on every screen lets you reopen the browser tab at any time.
+
+### Option B — CLI (legacy)
 
 ```bash
 cd backend
 python login.py
 ```
 
-A browser window opens — log in to Hailuo manually, then press **Enter** in the terminal. The session is saved to `hailuo_profile/` at the project root and reused for all future runs.
+A browser window opens — log in to Hailuo manually, then press **Enter** in the terminal.
 
 ---
 
@@ -155,6 +168,10 @@ The backend runs at `http://localhost:8001`.
 | `/health` | GET | Health check |
 | `/models` | GET | List available models |
 | `/generate-video` | POST | Generate a video for one shot |
+| `/auth/status` | GET | Check if the saved session is logged in |
+| `/auth/login/start` | POST | Open a visible Chrome window for manual login |
+| `/auth/login/verify` | POST | Close the Chrome window and verify the session cookie |
+| `/hailuo/open` | POST | Open or focus the Hailuo tab in the automation browser |
 
 **POST `/generate-video`** — requires `x-api-key` header:
 
@@ -184,7 +201,7 @@ Auto-generated API docs available at [http://localhost:8001/docs](http://localho
 
 ## Troubleshooting
 
-**Login session expired** — re-run `python login.py` to refresh the session.
+**Login session expired** — use the in-app login flow (click **Open Hailuo & Log In** on the Login screen) or re-run `python login.py` from the CLI.
 
 **"No file input found"** — Hailuo's UI may have changed. Check the screenshots saved in `backend/screenshots/` for a visual of what the browser saw.
 
