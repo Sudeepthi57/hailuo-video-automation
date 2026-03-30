@@ -9,8 +9,8 @@ interface Props {
   onBack: () => void;  // ← ADD THIS
 }
 
-const API_URL = "http://localhost:8001/generate-video";
-const API_KEY = "my-secret-key";
+const API_URL = `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001"}/generate-video`;
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? "my-secret-key";
 
 const MODELS = [
   {

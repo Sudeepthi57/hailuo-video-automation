@@ -25,6 +25,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 HAILUO_URL = "https://hailuoai.video/create/image-to-video"
 API_KEY = os.getenv("API_KEY", "my-secret-key")
+HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 VIDEO_WAIT_TIMEOUT_MS = 900000  # 15 mins
 SCREENSHOT_DIR = os.path.join(_HERE, "screenshots")
 HAILUO_PROFILE_DIR = os.path.join(_HERE, "..", "hailuo_profile")
@@ -75,14 +77,11 @@ async def get_context():
 
     _kill_hailuo_chrome()
     _pw_instance = await async_playwright().start()
+    extra_args = ["--start-maximized"] if not HEADLESS else []
     _ctx_instance = await _pw_instance.chromium.launch_persistent_context(
         user_data_dir=HAILUO_PROFILE_DIR,
-        channel="chrome",
-        headless=False,
-        args=[
-            "--start-maximized",
-            "--disable-blink-features=AutomationControlled",
-        ] + _chrome_launch_args(),
+        headless=HEADLESS,
+        args=extra_args + ["--disable-blink-features=AutomationControlled"] + _chrome_launch_args(),
         ignore_default_args=["--enable-automation"],
         viewport=None,
     )
@@ -105,7 +104,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -477,7 +476,6 @@ async def auth_status():
         async with async_playwright() as p:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=HAILUO_PROFILE_DIR,
-                channel="chrome",
                 headless=True,
                 args=_chrome_launch_args(),
                 ignore_default_args=["--enable-automation"],
@@ -513,11 +511,11 @@ async def auth_login_start():
 
     try:
         _login_pw = await async_playwright().start()
+        extra_args = ["--start-maximized"] if not HEADLESS else []
         _login_ctx = await _login_pw.chromium.launch_persistent_context(
             user_data_dir=HAILUO_PROFILE_DIR,
-            channel="chrome",
-            headless=False,
-            args=["--start-maximized"] + _chrome_launch_args(),
+            headless=HEADLESS,
+            args=extra_args + _chrome_launch_args(),
             ignore_default_args=["--enable-automation"],
             viewport=None,
         )
@@ -550,7 +548,6 @@ async def auth_login_verify():
         async with async_playwright() as p:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=HAILUO_PROFILE_DIR,
-                channel="chrome",
                 headless=True,
                 args=_chrome_launch_args(),
                 ignore_default_args=["--enable-automation"],
