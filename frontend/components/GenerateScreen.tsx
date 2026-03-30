@@ -10,7 +10,6 @@ interface Props {
 }
 
 const API_URL = `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001"}/generate-video`;
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? "my-secret-key";
 
 const MODELS = [
   {
@@ -69,7 +68,6 @@ export default function GenerateScreen({ shots, setShots, onBack }: Props) {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "x-api-key": API_KEY,
           },
           body: JSON.stringify({
             shot_id: shot.id,

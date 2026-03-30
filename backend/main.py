@@ -12,7 +12,7 @@ import subprocess
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
@@ -24,7 +24,6 @@ from playwright.async_api import async_playwright
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 HAILUO_URL = "https://hailuoai.video/create/image-to-video"
-API_KEY = os.getenv("API_KEY", "my-secret-key")
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 VIDEO_WAIT_TIMEOUT_MS = 900000  # 15 mins
@@ -128,10 +127,6 @@ class ShotResponse(BaseModel):
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
-
-async def verify_api_key(x_api_key: str):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
 
 async def download_image(url: str, shot_id: str) -> str:
     path = os.path.join(tempfile.gettempdir(), f"{shot_id}.png")
@@ -598,8 +593,7 @@ def get_models():
     return {"models": VALID_MODELS}
 
 @app.post("/generate-video", response_model=ShotResponse)
-async def generate_video(shot: ShotRequest, x_api_key: str = Header(...)):
-    await verify_api_key(x_api_key)
+async def generate_video(shot: ShotRequest):
     image_path = None
     try:
         print(f"\n{'='*50}")
