@@ -18,10 +18,13 @@ from playwright.async_api import async_playwright
 # CONFIG
 # ─────────────────────────────────────────────
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 HAILUO_URL = "https://hailuoai.video/create/image-to-video"
 API_KEY = os.getenv("API_KEY", "my-secret-key")
 VIDEO_WAIT_TIMEOUT_MS = 900000  # 15 mins
-SCREENSHOT_DIR = "./screenshots"
+SCREENSHOT_DIR = os.path.join(_HERE, "screenshots")
+HAILUO_PROFILE_DIR = os.path.join(_HERE, "..", "hailuo_profile")
 
 VALID_MODELS = ["Hailuo 2.3-Fast", "Hailuo 1.0-Director", "Hailuo 2.0"]
 
@@ -93,9 +96,16 @@ async def run_hailuo(shot_id: str, prompt: str, image_path: str, model: str = "H
         async with async_playwright() as p:
             print(f"  🌐 [{shot_id}] Launching Chrome...")
             context = await p.chromium.launch_persistent_context(
-                user_data_dir="./hailuo_profile",
+                user_data_dir=HAILUO_PROFILE_DIR,
+                executable_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
                 headless=False,
-                args=["--start-maximized"],
+                args=[
+                    "--start-maximized",
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+                ignore_default_args=["--enable-automation"],
                 viewport=None
             )
             page = await context.new_page()
