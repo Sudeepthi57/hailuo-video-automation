@@ -82,6 +82,21 @@ async function exec<T extends unknown[]>(
   });
 }
 
+// Runs in the MAIN world — required for Slate/React DOM manipulation
+// (isolated world has a separate JS context; Slate's editor.selection lives in MAIN)
+async function execMain<T extends unknown[]>(
+  tabId: number,
+  fn: (...args: T) => unknown,
+  args: T
+) {
+  return chrome.scripting.executeScript({
+    target: { tabId },
+    func: fn as (...args: unknown[]) => unknown,
+    args,
+    world: 'MAIN' as chrome.scripting.ExecutionWorld,
+  });
+}
+
 function notify(port: chrome.runtime.Port, shotId: string, step: string) {
   try {
     port.postMessage({ type: 'SHOT_PROGRESS', shotId, step } as BackgroundMsg);
@@ -92,6 +107,19 @@ function notify(port: chrome.runtime.Port, shotId: string, step: string) {
 
 // ── Self-contained injected functions ─────────────────────────────────────────
 // These run inside the page context — no closures over module variables allowed.
+
+function clearInputs() {
+  // The remove button is opacity-0 by default (only shown on hover).
+  // Simulate mouseenter on the container so React tracks hover state,
+  // then click the remove button directly.
+  document.querySelectorAll<HTMLElement>('.upload-image-container').forEach(container => {
+    container.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+    container.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    const removeBtn = container.querySelector<HTMLElement>('button[aria-label="Remove image"]');
+    if (removeBtn) removeBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  });
+
+}
 
 function dismissModal() {
   const btn = document.querySelector<HTMLElement>(
@@ -152,26 +180,19 @@ function fillPrompt(prompt: string) {
   el.click();
   el.focus();
 
-  // Delay so Slate processes the click/focus before we touch the selection
   setTimeout(() => {
-    // Select all existing content so it gets replaced
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    const sel = window.getSelection();
-    sel?.removeAllRanges();
-    sel?.addRange(range);
+    // selectAll fires selectionchange → Slate's listener (in MAIN world) syncs
+    // its internal editor.selection to "all selected"
+    document.execCommand('selectAll');
 
-    // Use ClipboardEvent paste — Slate's onPaste handler correctly creates
-    // data-slate-string text nodes via its own insertData path, whereas
-    // execCommand('insertText') writes directly into the DOM's zero-width
-    // placeholder span (data-slate-zero-width) without updating Slate state.
-    const dt = new DataTransfer();
-    dt.setData('text/plain', prompt);
-    el.dispatchEvent(new ClipboardEvent('paste', {
-      clipboardData: dt,
-      bubbles: true,
-      cancelable: true,
-    }));
+    // Wait one tick for Slate to process the selectionchange state update
+    setTimeout(() => {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', prompt);
+      el.dispatchEvent(new ClipboardEvent('paste', {
+        clipboardData: dt, bubbles: true, cancelable: true,
+      }));
+    }, 100);
   }, 500);
 }
 
@@ -258,16 +279,26 @@ async function runGeneration(
 
   if (tabs.length > 0 && tabs[0].id != null) {
     tabId = tabs[0].id;
-    notify(port, shot.id, 'Waiting for page to load...');
-    await navigateAndWait(tabId, HAILUO_URL);
+    // Only navigate if not already on the create page — avoids unnecessary refresh
+    if (!tabs[0].url?.startsWith(HAILUO_URL)) {
+      notify(port, shot.id, 'Waiting for page to load...');
+      await navigateAndWait(tabId, HAILUO_URL);
+      await sleep(4000);
+    } else {
+      await chrome.tabs.update(tabId, { active: true });
+      // Clear previous image and prompt before starting the next shot
+      notify(port, shot.id, 'Clearing previous inputs...');
+      await exec(tabId, clearInputs, []);
+      await sleep(1000);
+    }
   } else {
     const tab = await chrome.tabs.create({ url: HAILUO_URL });
     if (!tab.id) throw new Error('Failed to create tab');
     tabId = tab.id;
     notify(port, shot.id, 'Waiting for page to load...');
     await navigateAndWait(tabId, HAILUO_URL);
+    await sleep(4000);
   }
-  await sleep(4000);
 
   // Register gen state before any scripting so content script messages land
   const genState: GenState = {
@@ -296,15 +327,15 @@ async function runGeneration(
   // Start image upload in background (don't await yet)
   const uploadPromise: Promise<void> = shot.imageBase64
     ? (async () => {
-        notify(port, shot.id, 'Uploading reference image...');
-        await exec(tabId, uploadImage, [shot.imageBase64!]);
-        await sleep(15000); // wait for Hailuo server-side upload to confirm
-      })()
+      notify(port, shot.id, 'Uploading reference image...');
+      await exec(tabId, uploadImage, [shot.imageBase64!]);
+      await sleep(15000); // wait for Hailuo server-side upload to confirm
+    })()
     : Promise.resolve();
 
   // Fill prompt in parallel — ClipboardEvent doesn't need window focus
   notify(port, shot.id, 'Filling prompt...');
-  await exec(tabId, fillPrompt, [shot.prompt]);
+  await execMain(tabId, fillPrompt, [shot.prompt]);
   await sleep(2000);
 
   // Now wait for image upload to finish before clicking generate
