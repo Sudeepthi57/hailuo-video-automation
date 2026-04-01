@@ -36,7 +36,7 @@ const MODELS = [
 
 export default function GenerateScreen({ shots, setShots, onBack, generateShot, onOpenHailuo, onClear }: Props) {
   const [isRunning, setIsRunning] = useState(false);
-  const [currentIndex, setCurrentIndex] = useState(-1);
+
   const [allDone, setAllDone] = useState(false);
   const [selectedModel, setSelectedModel] = useState('Hailuo 2.3-Fast');
   const isRunningRef = useRef(false);
@@ -56,25 +56,58 @@ export default function GenerateScreen({ shots, setShots, onBack, generateShot, 
       if (!isRunningRef.current) break;
 
       const shot = shotsSnapshot[i];
-      setCurrentIndex(i);
 
-      // Mark as generating
       setShots((prev) =>
         prev.map((s) => (s.id === shot.id ? { ...s, status: 'generating' } : s))
       );
 
-      // Send to background — result comes back via port messages (handled in App.tsx)
       generateShot(shot, selectedModel);
 
-      // Wait for this shot to finish before moving to the next
-      await waitForShotCompletion(shot.id, shotsSnapshot);
-
-      if (!isRunningRef.current) break;
+      // Wait until the generate button has been clicked (generation submitted to Hailuo)
+      // before starting the next shot — don't wait for the video to finish
+      await waitForShotSubmitted(shot.id);
     }
+
+    // All shots submitted — now wait for all to finish in parallel
+    await Promise.all(shotsSnapshot.map((shot) => waitForShotCompletion(shot.id, shotsSnapshot)));
 
     setIsRunning(false);
     isRunningRef.current = false;
     setAllDone(true);
+  };
+
+  // Wait until background has clicked Generate for this shot (progress reaches "Waiting for video generation...")
+  const waitForShotSubmitted = (shotId: string): Promise<void> => {
+    return new Promise((resolve) => {
+      const TIMEOUT_MS = 3 * 60 * 1000; // 3 min max to submit
+      const startTime = Date.now();
+
+      const interval = setInterval(() => {
+        if (!isRunningRef.current) {
+          clearInterval(interval);
+          resolve();
+          return;
+        }
+        if (Date.now() - startTime > TIMEOUT_MS) {
+          clearInterval(interval);
+          resolve();
+          return;
+        }
+        setShots((prev) => {
+          const current = prev.find((s) => s.id === shotId);
+          if (
+            current &&
+            (current.status === 'done' ||
+              current.status === 'error' ||
+              current.progress === 'Waiting for video generation...')
+          ) {
+            clearInterval(interval);
+            resolve();
+          }
+          return prev;
+        });
+      }, 500);
+    });
   };
 
   // Poll shots state until the current shot is done or errored
@@ -318,7 +351,7 @@ export default function GenerateScreen({ shots, setShots, onBack, generateShot, 
           <div className="mb-6 flex items-center justify-center gap-3">
             <div className="inline-flex items-center gap-2 bg-blue-50 border border-blue-200 text-blue-700 text-sm px-4 py-2 rounded-xl">
               <div className="w-3.5 h-3.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              Generating shot {currentIndex + 1} of {readyShots.length} &middot; {selectedModel}
+              {doneCount + errorCount} / {readyShots.length} completed &middot; {selectedModel}
             </div>
             <button
               onClick={stopGeneration}
@@ -400,8 +433,8 @@ export default function GenerateScreen({ shots, setShots, onBack, generateShot, 
                   {shot.status === 'ready' && !isRunning && (
                     <span className="text-xs text-gray-400">Queued</span>
                   )}
-                  {shot.status === 'ready' && isRunning && idx > currentIndex && (
-                    <span className="text-xs text-gray-400">Waiting...</span>
+                  {shot.status === 'ready' && isRunning && (
+                    <span className="text-xs text-gray-400">Queued...</span>
                   )}
                   {statusIcon(shot)}
                 </div>
