@@ -15,7 +15,7 @@ export interface Shot {
   progress?: string;
 }
 
-export type Screen = 'upload' | 'review' | 'generate';
+export type Screen = 'upload' | 'review';
 
 // Messages popup → background (via port)
 export type PopupMsg =

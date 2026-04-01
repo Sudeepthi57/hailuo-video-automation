@@ -1,24 +1,66 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import type { Shot } from '../../types';
 
 interface Props {
   shots: Shot[];
-  setShots: (shots: Shot[]) => void;
-  onGenerate: () => void;
+  setShots: React.Dispatch<React.SetStateAction<Shot[]>>;
   onBack: () => void;
   onOpenHailuo: () => void;
   onClear: () => void;
+  generateShot: (shot: Shot, model: string) => void;
 }
 
-export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOpenHailuo, onClear }: Props) {
+const MODELS = [
+  {
+    id: 'Hailuo 2.3-Fast',
+    label: 'Hailuo 2.3-Fast',
+    badge: 'New',
+    desc: 'Faster speed, higher efficiency',
+    specs: '768P-1080P · 6s-10s',
+  },
+  {
+    id: 'Hailuo 2.0',
+    label: 'Hailuo 2.0',
+    badge: null,
+    desc: 'Best effect, ultra-clear quality',
+    specs: '512P-1080P · 6s-10s',
+  },
+  {
+    id: 'Hailuo 1.0-Director',
+    label: 'Hailuo 1.0-Director',
+    badge: null,
+    desc: 'Control camera like a director',
+    specs: '720P · 6s',
+  },
+];
+
+export default function ReviewScreen({ shots, setShots, onBack, onOpenHailuo, onClear, generateShot }: Props) {
   const [selectedId, setSelectedId] = useState(shots[0]?.id || '');
   const [imageDragging, setImageDragging] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const isRunningRef = useRef(false);
 
   const selected = shots.find((s) => s.id === selectedId) || shots[0];
-  const readyCount = shots.filter((s) => s.imagePreview && s.prompt).length;
+  const readyShots = shots.filter((s) => s.imagePreview && s.prompt);
+  const readyCount = readyShots.length;
+  const doneCount = shots.filter((s) => s.status === 'done').length;
+  const errorCount = shots.filter((s) => s.status === 'error').length;
 
   const updateShot = (id: string, updates: Partial<Shot>) => {
-    setShots(shots.map((s) => (s.id === id ? { ...s, ...updates } : s)));
+    setShots((prev) => prev.map((s) => (s.id === id ? { ...s, ...updates } : s)));
+  };
+
+  const deleteShot = (id: string) => {
+    setShots((prev) => {
+      const idx = prev.findIndex((s) => s.id === id);
+      const next = prev.filter((s) => s.id !== id);
+      if (id === selectedId && next.length > 0) {
+        setSelectedId(next[Math.min(idx, next.length - 1)].id);
+      }
+      return next;
+    });
   };
 
   // Crop image to 16:9 using canvas, returns base64 data URL
@@ -34,11 +76,9 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
           srcH = img.height;
 
         if (img.width / img.height > targetRatio) {
-          // Too wide — crop sides
           srcW = Math.round(img.height * targetRatio);
           srcX = Math.round((img.width - srcW) / 2);
         } else {
-          // Too tall — crop top/bottom
           srcH = Math.round(img.width / targetRatio);
           srcY = Math.round((img.height - srcH) / 2);
         }
@@ -49,8 +89,7 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
         const ctx = canvas.getContext('2d')!;
         ctx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, 1280, 720);
         URL.revokeObjectURL(url);
-        const base64 = canvas.toDataURL('image/jpeg', 0.92);
-        resolve(base64);
+        resolve(canvas.toDataURL('image/jpeg', 0.92));
       };
       img.src = url;
     });
@@ -96,7 +135,101 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
     [selected.id, shots]
   );
 
+  // ── Generation logic ──────────────────────────────────────────────────────
+
+  const waitForShotSubmitted = (shotId: string): Promise<void> => {
+    return new Promise((resolve) => {
+      const TIMEOUT_MS = 3 * 60 * 1000;
+      const startTime = Date.now();
+
+      const interval = setInterval(() => {
+        if (!isRunningRef.current) { clearInterval(interval); resolve(); return; }
+        if (Date.now() - startTime > TIMEOUT_MS) { clearInterval(interval); resolve(); return; }
+        setShots((prev) => {
+          const current = prev.find((s) => s.id === shotId);
+          if (
+            current &&
+            (current.status === 'done' ||
+              current.status === 'error' ||
+              current.progress === 'Waiting for video generation...')
+          ) {
+            clearInterval(interval);
+            resolve();
+          }
+          return prev;
+        });
+      }, 500);
+    });
+  };
+
+  const waitForShotCompletion = (shotId: string): Promise<void> => {
+    return new Promise((resolve) => {
+      const TIMEOUT_MS = 12 * 60 * 1000;
+      const startTime = Date.now();
+
+      const interval = setInterval(() => {
+        if (!isRunningRef.current) { clearInterval(interval); resolve(); return; }
+        if (Date.now() - startTime > TIMEOUT_MS) {
+          clearInterval(interval);
+          setShots((prev) =>
+            prev.map((s) =>
+              s.id === shotId && s.status === 'generating'
+                ? { ...s, status: 'error', errorMsg: 'Timed out waiting for result' }
+                : s
+            )
+          );
+          resolve();
+          return;
+        }
+        setShots((prev) => {
+          const current = prev.find((s) => s.id === shotId);
+          if (current && (current.status === 'done' || current.status === 'error')) {
+            clearInterval(interval);
+            resolve();
+          }
+          return prev;
+        });
+      }, 2000);
+    });
+  };
+
+  const runGeneration = async (model: string) => {
+    setShowModelPicker(false);
+    setSelectedModel(model);
+    setIsRunning(true);
+    isRunningRef.current = true;
+
+    const shotsSnapshot = shots.filter((s) => s.imagePreview && s.prompt);
+
+    for (let i = 0; i < shotsSnapshot.length; i++) {
+      if (!isRunningRef.current) break;
+
+      const shot = shotsSnapshot[i];
+      setShots((prev) =>
+        prev.map((s) => (s.id === shot.id ? { ...s, status: 'generating' } : s))
+      );
+
+      generateShot(shot, model);
+      await waitForShotSubmitted(shot.id);
+    }
+
+    await Promise.all(shotsSnapshot.map((shot) => waitForShotCompletion(shot.id)));
+
+    setIsRunning(false);
+    isRunningRef.current = false;
+  };
+
+  const stopGeneration = () => {
+    isRunningRef.current = false;
+    setIsRunning(false);
+  };
+
+  // ── Status helpers ────────────────────────────────────────────────────────
+
   const statusDot = (shot: Shot) => {
+    if (shot.status === 'done') return 'bg-green-500';
+    if (shot.status === 'generating') return 'bg-blue-500 animate-pulse';
+    if (shot.status === 'error') return 'bg-red-500';
     if (shot.imagePreview && shot.prompt) return 'bg-green-400';
     if (shot.imagePreview || shot.prompt) return 'bg-yellow-400';
     return 'bg-gray-300';
@@ -109,15 +242,10 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
         <div className="flex items-center gap-3">
           <button
             onClick={onBack}
-            className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-800 border border-gray-200 px-3 py-1.5 rounded-lg hover:bg-gray-50 transition-colors"
+            disabled={isRunning}
+            className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-800 border border-gray-200 px-3 py-1.5 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-40"
           >
-            <svg
-              className="w-3.5 h-3.5"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={2}
-            >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
             </svg>
             Back
@@ -128,34 +256,55 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
           <span className="text-sm text-gray-500">Review Shots</span>
         </div>
         <div className="flex items-center gap-3">
-          <span className="text-xs text-gray-400">
-            {readyCount} of {shots.length} ready
-          </span>
-          <div className="w-24 h-1.5 bg-gray-200 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-black rounded-full transition-all"
-              style={{ width: `${(readyCount / shots.length) * 100}%` }}
-            />
-          </div>
-          <button
-            onClick={onOpenHailuo}
-            className="text-xs text-gray-500 hover:text-gray-800 border border-gray-200 px-3 py-1.5 rounded-lg hover:bg-gray-50 transition-colors"
-          >
-            Open Hailuo
-          </button>
-          <button
-            onClick={onClear}
-            className="text-xs text-red-400 hover:text-red-600 border border-red-200 px-3 py-1.5 rounded-lg hover:bg-red-50 transition-colors"
-          >
-            Clear
-          </button>
-          <button
-            onClick={onGenerate}
-            disabled={readyCount === 0}
-            className="bg-black text-white text-xs px-4 py-2 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-800 transition-colors"
-          >
-            Generate All ({readyCount}) &rarr;
-          </button>
+          {isRunning ? (
+            <>
+              <span className="text-xs text-gray-400">
+                {doneCount} done &middot; {errorCount} errors &middot;{' '}
+                {readyCount - doneCount - errorCount} remaining
+              </span>
+              <div className="inline-flex items-center gap-1.5 text-xs text-blue-600 bg-blue-50 border border-blue-200 px-3 py-1.5 rounded-lg">
+                <div className="w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                Generating...
+              </div>
+              <button
+                onClick={stopGeneration}
+                className="text-xs text-gray-500 hover:text-gray-800 border border-gray-200 px-3 py-1.5 rounded-lg hover:bg-gray-50 transition-colors"
+              >
+                Stop
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="text-xs text-gray-400">
+                {readyCount} of {shots.length} ready
+              </span>
+              <div className="w-24 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-black rounded-full transition-all"
+                  style={{ width: `${(readyCount / shots.length) * 100}%` }}
+                />
+              </div>
+              <button
+                onClick={onOpenHailuo}
+                className="text-xs text-gray-500 hover:text-gray-800 border border-gray-200 px-3 py-1.5 rounded-lg hover:bg-gray-50 transition-colors"
+              >
+                Open Hailuo
+              </button>
+              <button
+                onClick={onClear}
+                className="text-xs text-red-400 hover:text-red-600 border border-red-200 px-3 py-1.5 rounded-lg hover:bg-red-50 transition-colors"
+              >
+                Clear
+              </button>
+              <button
+                onClick={() => setShowModelPicker(true)}
+                disabled={readyCount === 0}
+                className="bg-black text-white text-xs px-4 py-2 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-800 transition-colors"
+              >
+                Generate All ({readyCount}) &rarr;
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -170,7 +319,7 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
               <div
                 key={shot.id}
                 onClick={() => setSelectedId(shot.id)}
-                className={`flex items-center gap-3 px-4 py-3 cursor-pointer border-b border-gray-50 transition-colors
+                className={`group flex items-center gap-3 px-4 py-3 cursor-pointer border-b border-gray-50 transition-colors
                   ${
                     shot.id === selectedId
                       ? 'bg-gray-50 border-l-2 border-l-black'
@@ -181,16 +330,26 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
                 <div className="flex-1 min-w-0">
                   <p className="text-xs font-medium text-gray-800">Shot {shot.shotNumber}</p>
                   <p className="text-xs text-gray-400 truncate">
-                    {shot.visualDescription || 'No description'}
+                    {shot.status === 'generating' && shot.progress
+                      ? shot.progress
+                      : shot.status === 'error'
+                      ? shot.errorMsg
+                      : shot.visualDescription || 'No description'}
                   </p>
                 </div>
                 {shot.imagePreview && (
-                  <img
-                    src={shot.imagePreview}
-                    className="w-8 h-6 object-cover rounded"
-                    alt=""
-                  />
+                  <img src={shot.imagePreview} className="w-8 h-6 object-cover rounded group-hover:hidden" alt="" />
                 )}
+                <button
+                  onClick={(e) => { e.stopPropagation(); deleteShot(shot.id); }}
+                  disabled={isRunning}
+                  className="hidden group-hover:flex items-center justify-center w-6 h-6 rounded text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+                  title="Delete shot"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
               </div>
             ))}
           </div>
@@ -221,15 +380,62 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
                     const idx = shots.findIndex((s) => s.id === selectedId);
                     if (idx < shots.length - 1) setSelectedId(shots[idx + 1].id);
                   }}
-                  disabled={
-                    shots.findIndex((s) => s.id === selectedId) === shots.length - 1
-                  }
+                  disabled={shots.findIndex((s) => s.id === selectedId) === shots.length - 1}
                   className="text-xs px-3 py-1.5 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-40"
                 >
                   Next &rarr;
                 </button>
+                <button
+                  onClick={() => deleteShot(selected.id)}
+                  disabled={isRunning}
+                  className="text-xs px-3 py-1.5 border border-red-200 text-red-400 rounded-lg hover:bg-red-50 hover:text-red-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  Delete
+                </button>
               </div>
             </div>
+
+            {/* Done video link */}
+            {selected.status === 'done' && selected.videoUrl && (
+              <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-3 flex items-center gap-3">
+                <div className="w-5 h-5 bg-green-100 rounded-full flex items-center justify-center flex-shrink-0">
+                  <svg className="w-3 h-3 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  </svg>
+                </div>
+                <span className="text-xs text-green-700 font-medium">Video ready</span>
+                <a
+                  href={selected.videoUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  download={`shot-${selected.shotNumber}.mp4`}
+                  className="text-xs text-blue-500 hover:text-blue-700 underline ml-auto"
+                >
+                  Download
+                </a>
+                <button
+                  onClick={() => navigator.clipboard.writeText(selected.videoUrl!)}
+                  className="text-xs text-gray-400 hover:text-gray-600 border border-gray-200 px-2 py-0.5 rounded"
+                >
+                  Copy URL
+                </button>
+              </div>
+            )}
+
+            {/* Error message */}
+            {selected.status === 'error' && (
+              <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3">
+                <p className="text-xs text-red-600">{selected.errorMsg}</p>
+              </div>
+            )}
+
+            {/* Generating status */}
+            {selected.status === 'generating' && (
+              <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 flex items-center gap-2">
+                <div className="w-3.5 h-3.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+                <p className="text-xs text-blue-600">{selected.progress || 'Generating...'}</p>
+              </div>
+            )}
 
             {/* IMAGE UPLOAD — 16:9 enforced */}
             <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
@@ -285,10 +491,7 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
               ) : (
                 <div
                   onDrop={handleImageDrop}
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    setImageDragging(true);
-                  }}
+                  onDragOver={(e) => { e.preventDefault(); setImageDragging(true); }}
                   onDragLeave={() => setImageDragging(false)}
                   onClick={() => document.getElementById(`img-input-${selected.id}`)?.click()}
                   className={`relative w-full cursor-pointer transition-all ${
@@ -308,18 +511,8 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
                   />
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
                     <div className="w-12 h-12 bg-white border border-gray-200 rounded-xl flex items-center justify-center">
-                      <svg
-                        className="w-6 h-6 text-gray-400"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                        strokeWidth={1.5}
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909"
-                        />
+                      <svg className="w-6 h-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909" />
                       </svg>
                     </div>
                     <div className="text-center">
@@ -327,15 +520,9 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
                       <p className="text-xs text-gray-400 mt-1">or click to browse</p>
                     </div>
                     <div className="flex gap-2 mt-1">
-                      <span className="text-xs bg-white border border-gray-200 px-2 py-1 rounded-md text-gray-500">
-                        Drag &amp; Drop
-                      </span>
-                      <span className="text-xs bg-blue-50 border border-blue-200 px-2 py-1 rounded-md text-blue-600 font-medium">
-                        Ctrl+V Paste
-                      </span>
-                      <span className="text-xs bg-white border border-gray-200 px-2 py-1 rounded-md text-gray-500">
-                        Browse
-                      </span>
+                      <span className="text-xs bg-white border border-gray-200 px-2 py-1 rounded-md text-gray-500">Drag &amp; Drop</span>
+                      <span className="text-xs bg-blue-50 border border-blue-200 px-2 py-1 rounded-md text-blue-600 font-medium">Ctrl+V Paste</span>
+                      <span className="text-xs bg-white border border-gray-200 px-2 py-1 rounded-md text-gray-500">Browse</span>
                     </div>
                   </div>
                 </div>
@@ -419,6 +606,54 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOp
           </div>
         </div>
       </div>
+
+      {/* Model picker modal */}
+      {showModelPicker && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl shadow-xl w-[480px] p-6">
+            <h2 className="text-base font-semibold text-gray-900 mb-1">Select Model</h2>
+            <p className="text-xs text-gray-400 mb-4">Choose the model to use for all {readyCount} shots</p>
+            <div className="grid grid-cols-3 gap-3 mb-6">
+              {MODELS.map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => setSelectedModel(m.id)}
+                  className={`text-left rounded-xl border-2 p-3 transition-all cursor-pointer
+                    ${selectedModel === m.id ? 'border-black bg-gray-50' : 'border-gray-200 hover:border-gray-300'}`}
+                >
+                  <div className="flex items-center gap-1 mb-1">
+                    <span className="text-xs font-semibold text-gray-900 truncate">{m.label}</span>
+                    {m.badge && (
+                      <span className="text-[9px] bg-green-100 text-green-700 px-1 py-0.5 rounded font-semibold">
+                        {m.badge}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[10px] text-gray-400 leading-tight mb-1.5">{m.desc}</p>
+                  <span className="text-[9px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-medium">
+                    {m.specs}
+                  </span>
+                </button>
+              ))}
+            </div>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setShowModelPicker(false)}
+                className="text-xs text-gray-500 border border-gray-200 px-4 py-2 rounded-lg hover:bg-gray-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => selectedModel && runGeneration(selectedModel)}
+                disabled={!selectedModel}
+                className="bg-black text-white text-xs px-5 py-2 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-800 transition-colors"
+              >
+                Start Generating {readyCount} Videos &rarr;
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

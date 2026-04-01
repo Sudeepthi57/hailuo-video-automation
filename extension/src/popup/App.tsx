@@ -2,7 +2,6 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import type { Shot, Screen, BackgroundMsg, PopupMsg } from '../types';
 import UploadScreen from './components/UploadScreen';
 import ReviewScreen from './components/ReviewScreen';
-import GenerateScreen from './components/GenerateScreen';
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>('upload');
@@ -116,20 +115,10 @@ export default function App() {
         <ReviewScreen
           shots={shots}
           setShots={setShots}
-          onGenerate={() => setScreen('generate')}
           onBack={() => setScreen('upload')}
           onOpenHailuo={handleOpenHailuo}
           onClear={handleClearData}
-        />
-      )}
-      {screen === 'generate' && (
-        <GenerateScreen
-          shots={shots}
-          setShots={setShots}
-          onBack={() => setScreen('review')}
           generateShot={generateShot}
-          onOpenHailuo={handleOpenHailuo}
-          onClear={handleClearData}
         />
       )}
     </div>
