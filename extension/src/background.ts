@@ -293,25 +293,22 @@ async function runGeneration(
   await exec(tabId, selectModel, [shot.model]);
   await sleep(3000); // wait for dropdown close animation
 
-  // Upload image if provided
-  if (shot.imageBase64) {
-    notify(port, shot.id, 'Uploading reference image...');
-    await exec(tabId, uploadImage, [shot.imageBase64]);
-    await sleep(15000); // wait for Hailuo server-side upload to confirm
-  }
+  // Start image upload in background (don't await yet)
+  const uploadPromise: Promise<void> = shot.imageBase64
+    ? (async () => {
+        notify(port, shot.id, 'Uploading reference image...');
+        await exec(tabId, uploadImage, [shot.imageBase64!]);
+        await sleep(15000); // wait for Hailuo server-side upload to confirm
+      })()
+    : Promise.resolve();
 
-  // Bring the Hailuo window to focus — execCommand('insertText') silently
-  // does nothing when the window isn't focused (unlike Playwright which bypasses this)
-  const hailuoTab = await chrome.tabs.get(tabId);
-  if (hailuoTab.windowId) {
-    await chrome.windows.update(hailuoTab.windowId, { focused: true });
-    await sleep(500);
-  }
-
-  // Fill prompt
+  // Fill prompt in parallel — ClipboardEvent doesn't need window focus
   notify(port, shot.id, 'Filling prompt...');
   await exec(tabId, fillPrompt, [shot.prompt]);
   await sleep(2000);
+
+  // Now wait for image upload to finish before clicking generate
+  await uploadPromise;
 
   // Record submission time
   genState.submitTimeSec = Math.floor(Date.now() / 1000);
