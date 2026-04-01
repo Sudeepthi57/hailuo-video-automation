@@ -6,9 +6,11 @@ interface Props {
   setShots: (shots: Shot[]) => void;
   onGenerate: () => void;
   onBack: () => void;
+  onOpenHailuo: () => void;
+  onClear: () => void;
 }
 
-export default function ReviewScreen({ shots, setShots, onGenerate, onBack }: Props) {
+export default function ReviewScreen({ shots, setShots, onGenerate, onBack, onOpenHailuo, onClear }: Props) {
   const [selectedId, setSelectedId] = useState(shots[0]?.id || '');
   const [imageDragging, setImageDragging] = useState(false);
 
@@ -135,6 +137,18 @@ export default function ReviewScreen({ shots, setShots, onGenerate, onBack }: Pr
               style={{ width: `${(readyCount / shots.length) * 100}%` }}
             />
           </div>
+          <button
+            onClick={onOpenHailuo}
+            className="text-xs text-gray-500 hover:text-gray-800 border border-gray-200 px-3 py-1.5 rounded-lg hover:bg-gray-50 transition-colors"
+          >
+            Open Hailuo
+          </button>
+          <button
+            onClick={onClear}
+            className="text-xs text-red-400 hover:text-red-600 border border-red-200 px-3 py-1.5 rounded-lg hover:bg-red-50 transition-colors"
+          >
+            Clear
+          </button>
           <button
             onClick={onGenerate}
             disabled={readyCount === 0}

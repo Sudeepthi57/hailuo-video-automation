@@ -26,6 +26,7 @@
     "default_icon": {
       "128": "icon128.png"
     },
-    "default_title": "Hailuo Video Automation"
+    "default_title": "Hailuo Video Automation",
+    "default_popup": "popup/index.html"
   }
 }

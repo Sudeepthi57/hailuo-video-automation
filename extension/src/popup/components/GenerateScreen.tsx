@@ -6,6 +6,8 @@ interface Props {
   setShots: React.Dispatch<React.SetStateAction<Shot[]>>;
   onBack: () => void;
   generateShot: (shot: Shot, model: string) => void;
+  onOpenHailuo: () => void;
+  onClear: () => void;
 }
 
 const MODELS = [
@@ -32,7 +34,7 @@ const MODELS = [
   },
 ];
 
-export default function GenerateScreen({ shots, setShots, onBack, generateShot }: Props) {
+export default function GenerateScreen({ shots, setShots, onBack, generateShot, onOpenHailuo, onClear }: Props) {
   const [isRunning, setIsRunning] = useState(false);
   const [currentIndex, setCurrentIndex] = useState(-1);
   const [allDone, setAllDone] = useState(false);
@@ -189,10 +191,25 @@ export default function GenerateScreen({ shots, setShots, onBack, generateShot }
           <span className="text-gray-300">&middot;</span>
           <span className="text-sm text-gray-500">Generating Videos</span>
         </div>
-        <span className="text-xs text-gray-400">
-          {doneCount} done &middot; {errorCount} errors &middot;{' '}
-          {readyShots.length - doneCount - errorCount} remaining
-        </span>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-gray-400">
+            {doneCount} done &middot; {errorCount} errors &middot;{' '}
+            {readyShots.length - doneCount - errorCount} remaining
+          </span>
+          <button
+            onClick={onOpenHailuo}
+            className="text-xs text-gray-500 hover:text-gray-800 border border-gray-200 px-3 py-1.5 rounded-lg hover:bg-gray-50 transition-colors"
+          >
+            Open Hailuo
+          </button>
+          <button
+            onClick={onClear}
+            disabled={isRunning}
+            className="text-xs text-red-400 hover:text-red-600 border border-red-200 px-3 py-1.5 rounded-lg hover:bg-red-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Clear
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 max-w-3xl mx-auto w-full p-8">

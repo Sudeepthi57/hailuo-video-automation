@@ -154,27 +154,24 @@ function fillPrompt(prompt: string) {
 
   // Delay so Slate processes the click/focus before we touch the selection
   setTimeout(() => {
-    // Select all existing content via Range API (works without document focus)
+    // Select all existing content so it gets replaced
     const range = document.createRange();
     range.selectNodeContents(el);
     const sel = window.getSelection();
     sel?.removeAllRanges();
     sel?.addRange(range);
 
-    // Primary: execCommand fires native beforeinput which Slate handles
-    const inserted = document.execCommand('insertText', false, prompt);
-
-    if (!inserted) {
-      // Fallback: dispatch InputEvent directly using Slate's paste handler path
-      const dt = new DataTransfer();
-      dt.setData('text/plain', prompt);
-      el.dispatchEvent(new InputEvent('beforeinput', {
-        inputType: 'insertFromPaste',
-        dataTransfer: dt,
-        bubbles: true,
-        cancelable: true,
-      }));
-    }
+    // Use ClipboardEvent paste — Slate's onPaste handler correctly creates
+    // data-slate-string text nodes via its own insertData path, whereas
+    // execCommand('insertText') writes directly into the DOM's zero-width
+    // placeholder span (data-slate-zero-width) without updating Slate state.
+    const dt = new DataTransfer();
+    dt.setData('text/plain', prompt);
+    el.dispatchEvent(new ClipboardEvent('paste', {
+      clipboardData: dt,
+      bubbles: true,
+      cancelable: true,
+    }));
   }, 500);
 }
 
